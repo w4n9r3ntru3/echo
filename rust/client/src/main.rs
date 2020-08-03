@@ -1,9 +1,8 @@
-use crossbeam::TryRecvError;
 use std::{
     env,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, BufWriter, ErrorKind, Write},
     net::TcpStream,
-    thread,
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
@@ -15,68 +14,63 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     let host = format!("{}:{}", "localhost", &args[1]);
-    let mut client = TcpStream::connect(host).expect("Port not available");
+    let client = TcpStream::connect(host).expect("Port not available");
 
     client
         .set_nonblocking(true)
         .expect("Failed to initialize non-blocking Tcp stream");
 
-    let (sender_in, receiver_in) = crossbeam::unbounded();
-    let (sender_out, receiver_out) = crossbeam::unbounded();
+    let (snd_input, rcv_input) = crossbeam::unbounded();
+    let (snd_output, rcv_output) = crossbeam::unbounded();
 
-    let stdin = io::stdin();
+    let mut stdin_read = BufReader::new(io::stdin());
+    let mut client_write = BufWriter::new(client.try_clone().expect("Cannot clone client"));
+    let mut client_read = BufReader::new(client.try_clone().expect("Cannot clone client"));
 
-    // input thread
-    thread::spawn(move || loop {
-        let mut buf = String::new();
-        print!("Write a message:");
-        stdin
-            .read_line(&mut buf)
-            .expect("Unable to read from stdin");
-        sender_in.send(buf).expect("Input channel broken");
+    let mut handles = Vec::new();
 
-        wait();
-    });
+    // IO thread
+    handles.push(thread::spawn(move || loop {
+        println!("Write a message:");
 
-    // output thread
-    thread::spawn(move || loop {
-        if let Ok(msg) = receiver_out.try_recv() {
-            println!("Message exchanged: {}", msg);
+        let mut msg = String::new();
+        stdin_read
+            .read_line(&mut msg)
+            .expect("Cannot read from stdin");
+
+        snd_input.send(msg).expect("Cannot send through channel");
+
+        if let Ok(msg) = rcv_output.try_recv() {
+            println!("Exchanged: {}", msg);
         }
 
         wait();
-    });
+    }));
 
-    // client server thread
-    let mut reader = BufReader::new(client.try_clone().expect("Cannot clone Tcp stream"));
-    loop {
-        let mut buf = String::new();
-
-        match receiver_in.try_recv() {
-            Ok(msg) => {
-                if msg == ":quit" {
-                    break;
-                } else {
-                    let msg = format!("{}\n", msg.trim());
-                    client.write(msg.as_bytes()).expect("Server is down");
-                }
-            }
-            Err(TryRecvError::Empty) => {
-                continue;
-            }
-            Err(TryRecvError::Disconnected) => {
-                break;
-            }
+    // communication thread
+    handles.push(thread::spawn(move || loop {
+        if let Ok(msg) = rcv_input.try_recv() {
+            let msg = format!("{}\n", msg.trim());
+            client_write
+                .write(msg.as_bytes())
+                .expect("Cannot write to server");
+            client_write.flush().expect("Cannot flush");
         }
 
-        if let Ok(size) = reader.read_line(&mut buf) {
-            if size != 0 {
-                sender_out.send(buf).expect("Output channel broken");
-            }
+        let mut msg = String::new();
+
+        match client_read.read_line(&mut msg) {
+            Err(err) if err.kind() == ErrorKind::WouldBlock => (),
+            Ok(0) | Err(_) => break,
+            Ok(_) => snd_output.send(msg).expect("Cannot send through channel"),
         }
 
         wait();
-    }
+    }));
 
-    println!("Program Exit");
+    handles
+        .into_iter()
+        .map(JoinHandle::join)
+        .map(Result::unwrap)
+        .for_each(|_| ());
 }

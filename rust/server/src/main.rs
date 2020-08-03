@@ -1,8 +1,9 @@
 use std::{
+    collections::LinkedList,
     env,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, BufWriter, ErrorKind, Write},
     net::TcpListener,
-    thread,
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
@@ -13,12 +14,13 @@ fn main() {
 
     let args: Vec<String> = env::args().collect();
 
-    let port = &args[1];
+    let port = args.get(1).expect("Index out of bounds");
 
     let host = format!("{}:{}", "localhost", port);
     let server = TcpListener::bind(host).expect("Cannot listen to selected port");
 
-    let mut clients = vec![];
+    let (snd_io, rcv_io) = crossbeam::unbounded();
+    let (snd_inter, rcv_inter) = crossbeam::unbounded();
 
     server
         .set_nonblocking(true)
@@ -26,73 +28,81 @@ fn main() {
 
     println!("Start listening on port {}", port);
 
-    let (sender_msg, receiver_msg) = crossbeam::unbounded();
-    let (sender_cli, receiver_cli) = crossbeam::unbounded();
+    let mut handles = Vec::new();
 
-    // listening thread spawned so as not to block
-    thread::spawn(move || loop {
-        if let Ok((tcp_stream, address)) = server.accept() {
-            println!("Connection established: {}", address);
-
-            sender_cli
-                .send((
-                    tcp_stream.try_clone().expect("Cannot clone handle"),
-                    address.clone(),
-                ))
-                .expect("Cannot send connections over channel");
-
-            let sender_msg = sender_msg.clone();
-            let mut reader = BufReader::new(tcp_stream);
-
-            thread::spawn(move || loop {
-                let mut buf = String::new();
-
-                // this will always read until '\n'
-                match reader.read_line(&mut buf) {
-                    Ok(_) => {
-                        let buf = buf.trim();
-                        println!("Received '{}' from {}", buf, address);
-                        sender_msg
-                            .send(format!("{}: {}", address, buf))
-                            .expect("Channel broken");
-                    }
-                    Err(_) => {
-                        sender_msg
-                            .send(format!("Closing connection to: {}", address))
-                            .expect("Channel broken");
-                        break;
-                    }
-                }
-
-                wait();
-            });
-        }
-    });
-
-    // sending thread
-    loop {
-        if let Ok(conn) = receiver_cli.try_recv() {
-            clients.push(conn);
-        }
-
-        if let Ok(msg) = receiver_msg.try_recv() {
-            let msg = format!("{}\n", msg);
-            // update number of clients
-            println!("Sending to {:?}", clients);
-            clients = clients
-                .into_iter()
-                .filter_map(|(mut cli, addr)| match cli.write(msg.as_bytes()) {
-                    Ok(_) => Some((cli, addr)),
-                    Err(_) => {
-                        println!("Connection to {} closed", addr);
-                        None
-                    }
-                })
-                .collect();
+    // IO thread
+    handles.push(thread::spawn(move || loop {
+        if let Ok(msg) = rcv_io.try_recv() {
+            println!("Broadcasting: {}", msg);
         }
 
         wait();
-    }
+    }));
 
-    // unreachable!();
+    // communication thread
+    handles.push(thread::spawn(move || {
+        let mut connections = LinkedList::new();
+        loop {
+            if let Ok((conn, addr)) = server.accept() {
+                let mut conn_reader =
+                    BufReader::new(conn.try_clone().expect("Cannot clone connection"));
+                let conn_writer =
+                    BufWriter::new(conn.try_clone().expect("Cannot clone connection"));
+                connections.push_front(conn_writer);
+
+                snd_io
+                    .send(format!("Connected to {}", addr))
+                    .expect("Cannot send through channel");
+
+                let snd_inter = snd_inter.clone();
+
+                let snd_io = snd_io.clone();
+
+                thread::spawn(move || {
+                    loop {
+                        let mut msg = String::new();
+
+                        match conn_reader.read_line(&mut msg) {
+                            Err(err) if err.kind() == ErrorKind::WouldBlock => (),
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => snd_inter
+                                .send(format!("{}: {}", addr, msg))
+                                .expect("Cannot send through channel"),
+                        }
+
+                        wait();
+                    }
+                    snd_io
+                        .send(format!("Connection to {} closed", addr))
+                        .expect("Cannot send through channel");
+                });
+            }
+
+            if let Ok(msg) = rcv_inter.try_recv() {
+                let msg = format!("{}\n", msg.trim());
+                connections = connections
+                    .into_iter()
+                    .filter_map(|mut conn| match conn.write(msg.as_bytes()) {
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => Some(conn),
+                        Ok(0) | Err(_) => None,
+                        Ok(_) => {
+                            conn.flush().expect("Cannot flush");
+                            Some(conn)
+                        }
+                    })
+                    .collect();
+
+                snd_io.send(msg).expect("Cannot send through channel");
+                println!("Remaining connections: {:?}", connections);
+            }
+
+            wait();
+        }
+    }));
+
+    handles
+        .into_iter()
+        .map(JoinHandle::join)
+        .map(Result::unwrap)
+        .for_each(|_| ());
 }

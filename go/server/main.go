@@ -29,43 +29,69 @@ func main() {
 
 	fmt.Println("Listening to", localhost)
 
+	ioChan := make(chan string)
+	cliChan := make(chan string)
 	connChan := make(chan net.Conn)
-	strChan := make(chan string)
+	clients := make([]net.Conn, 0)
 
 	var wg sync.WaitGroup
 
-	cliMutex := sync.Mutex{}
-	clients := make([]net.Conn, 0)
-
-	mutexReadWrite := sync.Mutex{}
-
+	// IO thread
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+
+		for {
+			msg := <-ioChan
+			fmt.Println("Broadcasting:", msg)
+
+			wait()
+		}
+	}()
+
+	// communication thread
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
 		for {
 			conn, err := server.Accept()
 			if err != nil {
-				continue
+				log.Fatalln(err)
 			}
-
-			fmt.Println("Connected to", conn)
 
 			connChan <- conn
 
-			reader := bufio.NewReader(conn)
+			fmt.Println("Listening to:", conn.LocalAddr())
+			readConn := bufio.NewReader(conn)
 
+			wg.Add(1)
 			go func() {
-				for {
-					mutexReadWrite.Lock()
-					line, prefix, err := reader.ReadLine()
-					mutexReadWrite.Unlock()
+				defer wg.Done()
 
-					if prefix || err != nil {
-						fmt.Printf("Connection to %s closed\n", conn)
-						break
+				for {
+					line := make([]byte, 0)
+					prefix := true
+					var err error
+					for prefix {
+						var pline []byte
+						pline, prefix, err = readConn.ReadLine()
+						line = append(line, pline...)
+
+						if err != nil {
+							ioChan <- fmt.Sprint(err)
+							return
+						}
 					}
 
-					strChan <- string(line)
+					if len(line) == 0 {
+						continue
+					}
+
+					str := string(line)
+					cliChan <- str + "\n"
+
+					wait()
 				}
 			}()
 
@@ -73,39 +99,41 @@ func main() {
 		}
 	}()
 
+	// update clients
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+
 		for {
-			conn := <-connChan
-			cliMutex.Lock()
-			clients = append(clients, conn)
-			cliMutex.Unlock()
 
-			wait()
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for str := range strChan {
-			fmt.Println(str, clients)
-			cliMutex.Lock()
-			newClients := make([]net.Conn, 0)
-			for _, cli := range clients {
-				str := fmt.Sprintln(str)
-				mutexReadWrite.Lock()
-				_, err := cli.Write([]byte(str))
-				mutexReadWrite.Unlock()
-				if err != nil {
-					newClients = append(newClients, cli)
-				}
+			select {
+			case cli := <-connChan:
+				clients = append(clients, cli)
+			default:
 			}
-			clients = newClients
-			cliMutex.Unlock()
 
-			wait()
+			select {
+			case msg := <-cliChan:
+
+				onlineClients := make([]net.Conn, 0)
+				for _, cli := range clients {
+					_, err := cli.Write([]byte(msg))
+					if err != nil {
+						fmt.Printf("Connection to %s closed\n", cli.LocalAddr())
+						continue
+					}
+					onlineClients = append(onlineClients, cli)
+				}
+
+				clients = onlineClients
+
+				ioChan <- msg
+				ioChan <- fmt.Sprintln(clients)
+
+			default:
+				wait()
+			}
+
 		}
 	}()
 

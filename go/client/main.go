@@ -12,6 +12,8 @@ import (
 )
 
 func main() {
+	const EOF = "EOF encountered"
+	const QUIT = ":quit"
 	wait := func() { time.Sleep(1 * time.Second) }
 
 	args := os.Args
@@ -22,7 +24,7 @@ func main() {
 
 	localhost := fmt.Sprintf("localhost:%d", port)
 
-	client, err := net.Dial("tcp", localhost)
+	conn, err := net.Dial("tcp", localhost)
 	if err != nil {
 		log.Fatalf("Connection to %s failed", localhost)
 	}
@@ -31,75 +33,71 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	inChan := make(chan string)
-	outChan := make(chan string)
+	ioChan := make(chan string)
 
-	stdinReader := bufio.NewReader(os.Stdin)
+	stdinScanner := bufio.NewScanner(os.Stdin)
+	connScanner := bufio.NewScanner(conn)
 
-	cliReadWrite := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
-
-	mutexClient := sync.Mutex{}
-
-	// input thread
+	// IO thread
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+
 		for {
-			line, prefix, err := stdinReader.ReadLine()
-			if prefix || err != nil {
-				log.Fatalln("Read from stdin failed")
+			fmt.Println("Write a message:")
+
+			ok := stdinScanner.Scan()
+			if !ok {
+				log.Fatalln(EOF)
 			}
-			fmt.Println("sent")
-			inChan <- string(line) + "\n"
-
-			wait()
-		}
-	}()
-
-	// output thread
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			words := <-outChan
-			fmt.Println(words)
-
-			wait()
-		}
-	}()
-
-	// client server
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			mutexClient.Lock()
-			str, prefix, err := cliReadWrite.ReadLine()
-			mutexClient.Unlock()
-			if prefix || err != nil {
-				log.Fatalln("Connection broken")
+			if err := stdinScanner.Err(); err != nil {
+				log.Fatalln(err)
 			}
-			outChan <- string(str)
+			txt := stdinScanner.Text()
+
+			ioChan <- txt
+
+			if txt == QUIT {
+				break
+			}
+
+			output := <-ioChan
+
+			fmt.Println(output)
 
 			wait()
 		}
 	}()
 
+	// communication thread
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for {
-			str := <-inChan
 
-			mutexClient.Lock()
-			_, err := cliReadWrite.Write([]byte(str))
-			mutexClient.Unlock()
+		for {
+			snd := <-ioChan
+			if snd == QUIT {
+				break
+			}
+
+			_, err := conn.Write([]byte(snd + "\n"))
 			if err != nil {
-				log.Fatalln("Connection broken")
+				log.Fatalln(err)
 			}
+
+			ok := connScanner.Scan()
+			if !ok {
+				log.Fatalln(EOF)
+			}
+			if err := connScanner.Err(); err != nil {
+				log.Fatalln(err)
+			}
+
+			ioChan <- connScanner.Text()
 
 			wait()
 		}
 	}()
+
 	wg.Wait()
 }

@@ -105,16 +105,11 @@ func main() {
 		defer wg.Done()
 
 		for {
-
 			select {
 			case cli := <-connChan:
 				clients = append(clients, cli)
-			default:
-			}
 
-			select {
 			case msg := <-cliChan:
-
 				onlineClients := make([]net.Conn, 0)
 				for _, cli := range clients {
 					_, err := cli.Write([]byte(msg))
@@ -126,14 +121,11 @@ func main() {
 				}
 
 				clients = onlineClients
-
 				ioChan <- msg
-				ioChan <- fmt.Sprintln(clients)
 
 			default:
 				wait()
 			}
-
 		}
 	}()
 
